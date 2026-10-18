@@ -44,3 +44,8 @@ RTX 3060 12 GB, 30 GB RAM, Samsung NVMe, Qwen3.8-Flash-Next GSQ IQ2_XS, Strata v
 
 The cache got 3769 of the 4200 slots; the RAM budget holds ~74% of the experts outside the GPU. Results (ON vs closing OFF):
 ShareGPT120 decode +33.8% (paired ratio 0.747, 95% CI 0.734–0.761), cumulative time −23%; English47 +19.2% (paired 0.839, 0.819–0.861); official15 +3.2%, prefill unchanged.
+
+## Our raw numbers
+`results/*.csv`: one row per request and run (off_before, on, off_after) from the runs above, taken from the engine's
+own statistics: generated tokens, prompt/decode ms, TTFT, file/RAM expert reads, SSD bytes, RAM moves (and how many
+came out of a stage buffer). No request text. `charts/sharegpt120.png` is drawn from `results/sharegpt120.csv`.
