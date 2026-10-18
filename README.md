@@ -48,4 +48,4 @@ ShareGPT120 decode +33.8% (paired ratio 0.747, 95% CI 0.734–0.761), cumulative
 ## Our raw numbers
 `results/*.csv`: one row per request and run (off_before, on, off_after) from the runs above, taken from the engine's
 own statistics: generated tokens, prompt/decode ms, TTFT, file/RAM expert reads, SSD bytes, RAM moves (and how many
-came out of a stage buffer). No request text. `charts/sharegpt120.png` is drawn from `results/sharegpt120.csv`.
+came out of a stage buffer). No request text. `charts/sharegpt120-cumulative.png` is drawn from `results/sharegpt120.csv`.
