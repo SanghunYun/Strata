@@ -1,51 +1,85 @@
-# STRATA_RAM_ADAPT replay kit
+# STRATA_RAM_ADAPT replay kit (v0.2.1)
 
-Frozen chat requests and two scripts to compare `STRATA_RAM_ADAPT` off / on / off on your own machine. Only the
-client-side numbers are used (time to first token, total time, the server's `usage` block); no engine changes needed.
+Replays frozen chat requests against a running `serve/server.py` and compares settings from repeated fresh runs.
+Speeds come from the engine's own `timings` in the last stream chunk, so no engine changes or extra logging are needed.
+The v0.1.45 kit and its results are in [`v0.1.45/`](v0.1.45/).
 
-## Request sets (`requests/`)
-| file | requests | what |
+## Request sets
+| set | requests | what |
 | --- | ---: | --- |
-| `official15.json` | 15 | the bench suite's requests, captured once and frozen (4 warm-up, 3 chat, 4K, 16K, 6 agent) |
-| `sharegpt120.json` | 120 | built locally (not redistributed): 30 English ShareGPT conversations × first 4 turns, in order; history = the recorded replies |
-| `english47.json` | 47 | authored English session: 6 topics, 29 user/tool-loop turns + 18 background tasks, 38 tools |
+| `requests/sharegpt120.json` | 120 | continuous use: 30 English ShareGPT conversations × first 4 turns, in order; history = the recorded replies |
+| `standard-v1` | 22 | the repository's `bench/prompts/standard-v1` (warm-up, performance ×3, sanity), read straight from your Strata checkout; the optional concurrency stage is skipped |
 
-`sharegpt120.json` is not included (the dataset's text is not ours to redistribute); `sharegpt_build.py` builds it from
+`sharegpt120.json` is not redistributed; build it from
 [anon8231489123/ShareGPT_Vicuna_unfiltered](https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered)
-(revision `192ab2185289094fc556ec8ce5ce1e8e587154ca`, `ShareGPT_V3_unfiltered_cleaned_split.json`, sha256 `35f0e213…`):
-first 4 human/gpt pairs alternate, every message ≥97% ASCII and ≤4000 chars, history ≤24000 chars, sorted by id,
-shuffled with seed 0, first 30. Recorded replies are used as history so every run sees identical inputs.
+(revision `192ab2185289094fc556ec8ce5ce1e8e587154ca`, `ShareGPT_V3_unfiltered_cleaned_split.json`):
 
     python3 sharegpt_build.py --source ShareGPT_V3_unfiltered_cleaned_split.json --out requests/sharegpt120.json
     sha256sum requests/sharegpt120.json   # 5cd9da0827e6733c083d7a3abaec144a3516f00e2f28fae5728e2866d14c5859
 
-## Run
-1. Start the server three times, fresh each time, with the same flags; only the environment differs:
-   OFF = no `STRATA_RAM_ADAPT`, ON = `STRATA_RAM_ADAPT=1`. Order: OFF, ON, OFF (ON is judged against the closing OFF).
-2. For each start: `python3 replay.py --url http://127.0.0.1:8095 --requests requests/sharegpt120.json --out runs/sg-<arm>.jsonl`
-3. `python3 summarize.py runs/sg-off-a.jsonl runs/sg-on.jsonl runs/sg-off-b.jsonl`
+`replay.py --standard` builds the `standard-v1` bodies exactly as `strata bench run` does (v0.2.1 `payload_of`).
 
-It prints decode tok/s, TPOT and TTFT p50/p95, a paired per-request decode-time ratio with a bootstrap 95% interval,
-and the cumulative service time with the request from which ON stays ahead. Output lengths can differ between runs, so
-compare rates, not totals (the cumulative figure uses the closing OFF run's token counts).
+## Protocol we used
+Settings, each in a fresh engine, identical flags and environment except:
 
-## What we ran (for reference)
-RTX 3060 12 GB, 30 GB RAM, Samsung NVMe, Qwen3.8-Flash-Next GSQ IQ2_XS, Strata v0.1.45 + the PR commit.
+| name | binary | environment |
+| --- | --- | --- |
+| `off` | v0.2.1 | none |
+| `ram-adapt-8` | v0.2.1 | `STRATA_RAM_ADAPT=8` |
+| `ram-adapt2` | v0.2.1 | `STRATA_RAM_ADAPT=8 STRATA_RAM_ADAPT2=1` |
+| `pr` | v0.2.1 + the PR commit | `STRATA_RAM_ADAPT=1` |
+
+Three runs per setting and request set, interleaved: off, a8, a2, pr | pr, a2, a8, off | a2, off, pr, a8. Before every
+run: stop the server, `python3 drop_cache.py <pack dir> <gguf dir>`, wait 60 s, start the server with the setting, then
+
+    python3 replay.py --url http://127.0.0.1:8080 --requests requests/sharegpt120.json --engine-pid <strata pid> \
+        --out runs/sharegpt-<setting>-<n>.jsonl
+    python3 replay.py --url http://127.0.0.1:8080 --standard <Strata>/bench/prompts/standard-v1 --engine-pid <strata pid> \
+        --out runs/standard-<setting>-<n>.jsonl
+
+Use the same expert profile file in every run and do not let the engine save it (`--expert-profile-save` off), so no
+run starts from a placement an earlier run learned. Then
+
+    python3 summarize.py --ref ram-adapt-8 off='runs/sharegpt-off-*.jsonl' ram-adapt-8='runs/sharegpt-ram-adapt-8-*.jsonl' \
+        ram-adapt2='runs/sharegpt-ram-adapt2-*.jsonl' pr='runs/sharegpt-pr-*.jsonl'
+
+prints, per setting, the mean of the runs and their A/A range (decode, prompt, session time, TTFT p50, storage read
+GB, and for the 120-request set the decode rate by request block 1-10 / 11-30 / 31-60 / 61-120), and every setting
+against `--ref` with a Welch 95% interval. It refuses runs whose request bodies differ. Output lengths differ between
+runs, so compare rates, not totals.
+
+## What we ran
+RTX 3060 12 GB, 32 GB RAM, Samsung PM981 NVMe, Linux, Qwen3.8-Flash-Next GSQ IQ2_XS read in place, v0.2.1 `90767252`.
 
     strata --serve --prefill auto:16384 --spec 3 --mtp-max-t 3 --spec-min-p 0.5 --suffix-draft 0 --max-context 131072
       --kv k8v4 --pool-workers 7 --ple-io direct --greedy --stop-eos --stats --mmap-experts --mtp <mtp dir>
       --prompt-cache-root 1024 --prompt-cache-every 0 --conversation-cache-min-free-mib 1280 --tail-role-token 8678
-      --conversation-cache-min-tokens 3072 --pack <pack> --native <IQ2_XS gguf> --expert-profile <stock profile>
+      --conversation-cache-min-tokens 3072 --pack <IQ2_XS pack> --native <IQ2_XS gguf> --expert-profile <stock profile>
       --resident-budget-gib 20.5 --expert-cache 4200 --vram-reserve-mib 768 --adapt-async 1
       --conversation-cache-mib 1536 --conversation-cache-slots 3 --prompt-cache 2
     env: STRATA_UNBUFFERED_LOAD=1 STRATA_STAGER_THREADS=8 STRATA_STAGER_RING=32 STRATA_LOOKAHEAD=1
          STRATA_PREFILL_CPU_SHARE=auto STRATA_RESIDENT_HEADROOM_GIB=0 STRATA_ADAPT_OVERLAP=0 STRATA_ROUTE_TAIL_SKIP=7
-         CUDA_MODULE_LOADING=LAZY; ON adds STRATA_RAM_ADAPT=1
+         CUDA_MODULE_LOADING=LAZY, plus the setting's variables
 
-The cache got 3769 of the 4200 slots; the RAM budget holds ~74% of the experts outside the GPU. Results (ON vs closing OFF):
-ShareGPT120 decode +33.8% (paired ratio 0.747, 95% CI 0.734–0.761), cumulative time −23%; English47 +19.2% (paired 0.839, 0.819–0.861); official15 +3.2%, prefill unchanged.
+Requests went through our serving copy of `serve/server.py` (from v0.1.41, with a local logging wrapper), not v0.2.1's;
+the engine ran `--greedy`, so `standard-v1`'s sampling settings did not apply. This is not a submittable standard result.
 
-## Our raw numbers
-`results/*.csv`: one row per request and run (off_before, on, off_after) from the runs above, taken from the engine's
-own statistics: generated tokens, prompt/decode ms, TTFT, file/RAM expert reads, SSD bytes, RAM moves (and how many
-came out of a stage buffer). No request text. `charts/sharegpt120-cumulative.png` is drawn from `results/sharegpt120.csv`.
+## Our raw numbers (`results/v0.2.1/`)
+One file per run in `replay.py`'s format (`<set>-<setting>-<n>.jsonl`, `run_order` = position in the interleaved order),
+plus `.meta.json` with the engine's storage read bytes, and `*-summary.json` from `summarize.py`. Taken from the engine's
+own statistics; no request or answer text. `summarize.py` on these files gives:
+
+| ShareGPT 120 | off | ram-adapt-8 | ram-adapt2 | pr |
+| --- | ---: | ---: | ---: | ---: |
+| decode tok/s | 37.70 | 48.71 | 47.65 | 51.40 |
+| prompt tok/s | 117.8 | 137.4 | 134.5 | 141.5 |
+| session s | 931 | 743 | 761 | 701 |
+| storage read GB | 956 | 408 | 506 | 308 |
+
+| standard-v1 | off | ram-adapt-8 | ram-adapt2 | pr |
+| --- | ---: | ---: | ---: | ---: |
+| decode tok/s | 42.04 | 47.58 | 45.37 | 48.34 |
+| prompt tok/s | 572.1 | 578.3 | 577.2 | 578.2 |
+
+pr vs ram-adapt-8: ShareGPT decode +5.52% (95% CI +4.56..+6.49), prompt +2.94% (+1.02..+4.87), storage read −24.5%;
+standard-v1 decode +1.60% (−0.96..+4.17), prompt −0.02%.
