@@ -81,5 +81,8 @@ own statistics; no request or answer text. `summarize.py` on these files gives:
 | decode tok/s | 42.04 | 47.58 | 45.37 | 48.34 |
 | prompt tok/s | 572.1 | 578.3 | 577.2 | 578.2 |
 
+`charts/plot_v021.py` draws `charts/sharegpt120-v021.png` (decode tok/s, prompt tok/s and file reads per token over
+10-request windows of the 3 runs per setting) from these files.
+
 pr vs ram-adapt-8: ShareGPT decode +5.52% (95% CI +4.56..+6.49), prompt +2.94% (+1.02..+4.87), storage read −24.5%;
 standard-v1 decode +1.60% (−0.96..+4.17), prompt −0.02%.
