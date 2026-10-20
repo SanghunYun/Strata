@@ -53,13 +53,15 @@ RTX 3060 12 GB, 32 GB RAM, Samsung PM981 NVMe, Linux, Qwen3.8-Flash-Next GSQ IQ2
 
     strata --serve --prefill auto:16384 --spec 3 --mtp-max-t 3 --spec-min-p 0.5 --suffix-draft 0 --max-context 131072
       --kv k8v4 --pool-workers 7 --ple-io direct --greedy --stop-eos --stats --mmap-experts --mtp <mtp dir>
-      --prompt-cache-root 1024 --prompt-cache-every 0 --conversation-cache-min-free-mib 1280 --tail-role-token 8678
+      --prompt-cache-root 1024 --prompt-cache-every 0 --vision --conversation-cache-min-free-mib 768
+      --conversation-cache-min-free-mib 1280 --tail-role-token 8678
       --conversation-cache-min-tokens 3072 --pack <IQ2_XS pack> --native <IQ2_XS gguf> --expert-profile <stock profile>
       --resident-budget-gib 20.5 --expert-cache 4200 --vram-reserve-mib 768 --adapt-async 1
       --conversation-cache-mib 1536 --conversation-cache-slots 3 --prompt-cache 2
     env: STRATA_UNBUFFERED_LOAD=1 STRATA_STAGER_THREADS=8 STRATA_STAGER_RING=32 STRATA_LOOKAHEAD=1
-         STRATA_PREFILL_CPU_SHARE=auto STRATA_RESIDENT_HEADROOM_GIB=0 STRATA_ADAPT_OVERLAP=0 STRATA_ROUTE_TAIL_SKIP=7
-         CUDA_MODULE_LOADING=LAZY, plus the setting's variables
+         STRATA_PREFILL_CPU_SHARE=auto STRATA_RESIDENT_HEADROOM_GIB=0 STRATA_GGUF_PTE_BUDGET_MB=23500
+         STRATA_KV_RECLAIM_EXPERTS=1 STRATA_RETAIN_TURN_BOUNDARIES=0 STRATA_ADAPT_OVERLAP=0 STRATA_ROUTE_TAIL_SKIP=7
+         STRATA_PREFILL_TIMING=1 STRATA_DECODE_TIMING=1 CUDA_MODULE_LOADING=LAZY, plus the setting's variables
 
 Requests went through our serving copy of `serve/server.py` (from v0.1.41, with a local logging wrapper), not v0.2.1's;
 the engine ran `--greedy`, so `standard-v1`'s sampling settings did not apply. This is not a submittable standard result.
