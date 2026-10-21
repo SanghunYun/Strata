@@ -88,3 +88,25 @@ own statistics; no request or answer text. `summarize.py` on these files gives:
 
 pr vs ram-adapt-8: ShareGPT decode +5.52% (95% CI +4.56..+6.49), prompt +2.94% (+1.02..+4.87), storage read −24.5%;
 standard-v1 decode +1.60% (−0.96..+4.17), prompt −0.02%.
+
+## IQ3_XXS (`results/v0.2.1-iq3/`)
+The same runs with Qwen3.8-Flash-Next GSQ IQ3_XXS: the same binaries, profile, engine arguments and environment except
+`--pack <IQ3_XXS pack> --native <IQ3_XXS gguf>`. The expert cache then holds 2791 VRAM slots (IQ2_XS: 3769).
+`summarize.py` on these files gives:
+
+| ShareGPT 120 | off | ram-adapt-8 | ram-adapt2 | pr |
+| --- | ---: | ---: | ---: | ---: |
+| decode tok/s | 23.24 | 33.07 | 31.20 | 38.71 |
+| prompt tok/s | 79.9 | 97.8 | 95.4 | 104.2 |
+| session s | 1527 | 1104 | 1161 | 977 |
+| storage read GB | 2215 | 1105 | 1311 | 717 |
+
+| standard-v1 | off | ram-adapt-8 | ram-adapt2 | pr |
+| --- | ---: | ---: | ---: | ---: |
+| decode tok/s | 28.59 | 36.33 | 33.27 | 37.73 |
+| prompt tok/s | 503.6 | 514.4 | 513.7 | 514.0 |
+
+pr vs ram-adapt-8: ShareGPT decode +17.07% (95% CI +15.12..+19.02), prompt +6.54% (+3.77..+9.31), storage read −35.1%;
+standard-v1 decode +3.87% (−0.21..+7.95), prompt −0.08%.
+
+`charts/plot_v021_models.py` draws `charts/sharegpt120-v021-iq2-iq3.png`: both models, one row each, a shared y axis per column.
