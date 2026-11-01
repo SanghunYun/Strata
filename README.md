@@ -1,212 +1,93 @@
-<h1 align="center">Strata</h1>
+# SSD Expert Supply
 
-**English** · [简体中文](README.zh-CN.md) · [日本語](README.ja.md) · [Deutsch](README.de.md) · [Français](README.fr.md) · [Español](README.es.md) · [Português](README.pt-BR.md)
+**RAM에 다 들어가지 않는 MoE 모델을 위한, SSD expert 공급 최적화 연구 엔진.**
 
-<p align="center"><b>Run a 125-billion-parameter AI model on your own gaming PC</b><br>
-NVIDIA or AMD graphics card (12 GB or more) · Windows or Linux · free and open source</p>
+이 프로젝트는 [Strata](https://github.com/Niko1221/Strata)를 기반으로 SSD·DRAM·VRAM 사이의 expert 공급 경로를 연구합니다. 필요한 가중치를 SSD에서 읽어 계산에 사용할 수 있을 때까지의 시간을 줄이고, 실제 입력 처리와 답변 생성 속도를 높이는 것이 목표입니다.
 
-<p align="center"><a href="https://github.com/Niko1221/Strata/releases/download/v0.1.10/Pagoda.mp4"><img src="docs/media/pagoda-preview.webp" width="720" alt="A voxel pagoda garden that Strata's model wrote, running in the browser"></a><br>
-<sub>A voxel pagoda garden, 1 shot prompt running on an RTX 5070 with Strata (IQ3_S, 128K context) ·
-<a href="https://github.com/Niko1221/Strata/releases/download/v0.1.10/Pagoda.mp4">full video (49 s)</a></sub></p>
+출발점은 RAM expert 배치를 대화에 맞춰 바꾸는 RAM_ADAPT와 추론 시간·읽기량을 기록한 기존 실험입니다. 파일 배치, 병렬 읽기, DRAM 버퍼, 캐시, 미리 읽기, 계산과 I/O의 겹치기까지 범위를 넓힙니다.
 
-Strata runs **[Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next)** on a normal PC. This is a
-large, smart AI model that usually needs a server. It chats, writes code, reads pictures and works with your apps
-and coding agents. Nothing leaves your PC.
+> 현재는 연구 기반을 정리하는 단계입니다. 아래 성능 수치는 이전 RAM_ADAPT 실험이며, 새 프로젝트의 최신 성능이나 모든 장비에서의 개선을 뜻하지 않습니다.
 
-## How fast is it?
+이 `main`의 엔진 소스는 2026-10-08의 Strata `fb58e0db`에서 출발합니다. 아래에 소개하는 v0.2.7 반영 기능과 로컬 v0.2.9 관측 구성은 아직 이 브랜치에 동기화하지 않았습니다. 이번 변경은 프로젝트 소개 문서입니다. 기존 설치·사용 안내는 [원본 README 보관본](README.upstream.md)에 보존했습니다.
 
-We measured it on two ordinary gaming PCs. A token is about ¾ of a word.
+## 어떤 문제를 다루나요?
 
-- **Writes answers:** how fast the reply appears in a short chat. 60 tokens per second is faster than you can read.
-- **Reads your prompt:** how fast it takes in what you send (here a 32K-token document, code or chat history).
+MoE 모델은 매 토큰마다 일부 expert만 계산하지만, 다음 토큰이 사용할 expert는 달라집니다. 전체 가중치가 RAM·VRAM에 들어가지 않는 PC에서는 나머지를 SSD에서 공급해야 합니다.
 
-<table>
-<tr><th>NVIDIA: RTX 5070 (12 GB), Ryzen 5 7600, 64 GB RAM</th><th>AMD: RX 9070 XT (16 GB), Ryzen 9 3900X, 47 GB RAM</th></tr>
-<tr><td>
+이때 중요한 것은 SSD의 순차 읽기 사양만이 아닙니다. 필요한 데이터를 얼마나 큰 단위로 읽는지, 몇 개의 요청을 동시에 처리하는지, 읽은 데이터를 얼마나 재사용하는지, 계산이 얼마나 기다리는지가 실제 속도를 결정합니다.
 
-| Size | Writes answers | Reads your prompt |
-| --- | ---: | ---: |
-| **Q2_0** | 94 tokens/s | 2,650 tokens/s |
-| **IQ2_XS** | 79 tokens/s | 2,090 tokens/s |
-| **IQ3_XXS** | 62 tokens/s | 1,750 tokens/s |
-| **IQ3_S** | 53 tokens/s | 1,620 tokens/s |
-| **Coder** | 55 tokens/s | 2,180 tokens/s |
+우리는 다음을 함께 측정하고 개선합니다.
 
-</td><td>
+| 대상 | 연구할 내용 |
+|---|---|
+| 파일 배치와 읽기 | expert 저장 단위, 인접 읽기 병합, 비동기 I/O와 동시 요청 수 |
+| DRAM 버퍼 | 할당·복사·동기화 비용, 읽은 버퍼의 재사용 |
+| expert 보관 | DRAM·VRAM 배치, 반입·퇴출 비용, 프리필과 decode의 캐시 간섭 |
+| 미리 읽기와 실행 | 필요한 읽기의 우선순위, 예측 실패 비용, 읽기·전송·계산의 겹치기 |
 
-| Size | Writes answers | Reads your prompt |
-| --- | ---: | ---: |
-| **Q2_0** | 60 tokens/s | 1,160 tokens/s |
-| **IQ2_XS** | 52 tokens/s | 1,110 tokens/s |
-| **Coder** | 44 tokens/s | 1,420 tokens/s |
+연구의 기준은 **요청한 expert가 계산에 준비되기까지 걸린 시간과 실제 추론 속도**입니다.
 
-</td></tr>
-</table>
+## 지금까지의 작업
 
-NVIDIA: Q2_0 with engine 0.1.36, the other rows with 0.1.26 (4K answers, 32K prompts). The full tables are in
-[DETAILS.md](docs/DETAILS.md#speed-measured). A card with more VRAM is faster: an RTX 3090 (24 GB) should write
-about 100-140 tokens per second. Long chats and other cards: [speed of each model](docs/MODELS.md#how-fast-is-each-size),
-[community results](docs/COMMUNITY_BENCHMARKS.md).
+### RAM_ADAPT 개선
 
-<p align="center"><a href="https://buymeacoffee.com/strataengine"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" height="50"></a><br>
-<sub>Strata is free. If it runs well on your PC, a coffee keeps the work on it going.</sub></p>
+RAM에 없던 expert를 반복해서 사용하면 RAM의 덜 쓰이는 expert와 교체해 다음 SSD 읽기를 줄입니다. 개선된 경로는 직전 읽기의 stage buffer에 가중치가 남아 있으면 파일을 다시 읽지 않고 복사하며, 한 층에서 최대 4쌍을 교체합니다.
 
-## What you need
+이 작업은 [PR #3060](https://github.com/Niko1221/Strata/pull/3060)을 통해 Strata v0.2.7에 반영됐습니다. 현재 upstream에도 있는 기능이며, 새 포크만의 기능으로 주장하지 않습니다.
 
-| | |
-| --- | --- |
-| **Graphics card** | **NVIDIA** GeForce RTX 20, 30, 40 or 50 series, or **AMD** Radeon RX 7900 XT / XTX, RX 7800 XT / 7700 XT, RX 9060 XT, RX 9070 / 9070 XT, Radeon AI PRO R9700 or RX 6800 / 6900 series. It needs **12 GB of VRAM or more**. |
-| **RAM** | 32 GB or more. Your RAM decides [which model](#which-model-should-i-pick) fits. 64 GB runs every size. |
-| **Disk** | About 80 GB free. Use an SSD if you can: the first start is much faster. |
-| **System** | Windows 10 / 11 or Linux, and a current graphics driver from NVIDIA or AMD. |
+아래는 **v0.2.1 기반 실험**에서 같은 모델과 조건으로 120개 ShareGPT 요청을 순서대로 재생한 결과입니다. 각 설정을 새 엔진에서 3회 측정했습니다.
 
-The installer sets up everything else. Two or three cards can share the model ([multi-GPU](docs/MULTI_GPU.md)).
+| 모델 | RAM_ADAPT 끔 | 개선 전 `=8` | stage-buffer 개선 `=1` | 개선 전 대비 |
+|---|---:|---:|---:|---:|
+| IQ2_XS decode | 37.70 tok/s | 48.71 tok/s | **51.40 tok/s** | **+5.5%** |
+| IQ3_XXS decode | 23.24 tok/s | 33.07 tok/s | **38.71 tok/s** | **+17.1%** |
 
-Experimental, written and tested by community members on their own machines:
+측정 환경: RTX 3060 12GB, RAM 32GB, Linux, NVMe SSD, RAM expert 예산 20.5GiB, K8V4, MTP 3/T3, async adaptation 사용. 각 실행은 같은 초기 stock expert profile에서 시작하고 모델의 page cache를 비웠습니다. 실제 VRAM expert slot은 IQ2 3,769개, IQ3 2,791개였습니다. 같은 모델 안에서 설정을 비교한 수치입니다.
 
-- **Older graphics cards** (Tesla P40 / V100, GTX 10, Radeon VII / MI50, RX 6700 XT, RX 5500 XT): [Older GPUs](docs/OLDER_GPUS.md).
-- **Intel Arc**, built from source on Linux: [Intel Arc](docs/INTEL_ARC.md).
-- **AMD Ryzen AI Max (Strix Halo)**, built from source on Linux: [Strix Halo](docs/STRIX_HALO.md).
-- **Older processors without AVX2**: they work, but slowly. [Older CPUs](docs/INSTALL.md#older-cpus-experimental).
+`standard-v1` 요청 재생에서 개선 전 `=8` 대비 추가 decode 이득은 IQ2 +1.6%, IQ3 +3.9%로 측정 변동과 구분되지 않았습니다. 이 재생은 `--greedy`를 사용했으므로 공식 `strata bench run` 표준 결과가 아닙니다. 짧은 요청부터 긴 대화까지 항상 같은 이득이 난다는 결론은 내리지 않습니다.
 
-The full list: [docs/INSTALL.md](docs/INSTALL.md#what-you-need).
+입력 구성과 실행별 수치는 [재현 키트](https://github.com/SanghunYun/Strata/tree/ram-adapt-replay)와 [PR의 측정 조건](https://github.com/Niko1221/Strata/pull/3060)에 있습니다.
 
-## Install
+### 관측과 재현
 
-### Let your AI set it up
+- 입력 처리와 decode 시간을 구간별로 기록하고, 전체 시간과 구간 합의 잔차를 확인합니다.
+- decode window별 시간, expert 읽기, RAM 교체를 기록하는 선택적 계측을 만들었습니다. [PR #3631](https://github.com/Niko1221/Strata/pull/3631)
+- 엔진 재시작, 초기 expert profile 복원, 설정별 workload 재생, 설정·프로필 복원을 기존 실험 도구로 수행합니다.
 
-Do you use an AI coding assistant (Claude Code, Cursor, Codex, GitHub Copilot, ...)? Paste this into it:
+현재 로컬 기준 엔진은 Strata v0.2.9에 기존 관측 기능을 적용한 구성입니다. 빌드와 기동 확인은 완료했으며, 대표 workload의 최신 성능 비교는 다음 단계입니다.
 
-```text
-Set up Strata on this PC for me: https://github.com/Niko1221/Strata - follow docs/AI_SETUP.md in that repository.
-```
+## 다음 실험
 
-It checks your graphics card, RAM and disk and picks the model that fits. Then it installs and starts it and tells
-you how to connect your apps. AI tools can also install, start and stop Strata through its
-[MCP server](docs/MCP_SERVER.md).
+1. 같은 최신 구성에서 기준선을 두 번 측정해 실행 변동과 시간표를 확인합니다.
+2. SSD 읽기, DRAM 복사, 버퍼 대기, 계산과 겹치는 시간을 구분합니다.
+3. 실제 expert 읽기 요청을 기록하고 재생하는 공급 벤치마크를 만듭니다.
+4. 큰 병목부터 한 가지씩 바꾸고, 공급 측정과 실제 엔진 양쪽에서 검증합니다.
 
-### Or do it yourself
+첫 개발 환경은 Linux·NVIDIA GPU와 Qwen3.8-Flash-Next입니다. 다른 장비와 모델의 성능·호환성은 해당 환경에서 측정한 뒤 표시합니다.
 
-[Download Strata](https://github.com/Niko1221/Strata/archive/refs/heads/main.zip) and unzip it (or `git clone` it).
-**Windows:** double-click **`START-HERE.bat`**. **Linux:** run **`./setup.sh`** in the Strata folder.
+## 측정 원칙
 
-The steps are the same for NVIDIA and AMD. The installer finds your card and sets up the right engine for it. It
-asks you a few questions:
+- 같은 모델·계산 설정·메모리 예산으로 변경 전후를 비교합니다.
+- prefill과 decode, 짧은 입력과 긴 입력을 나눠 보고합니다.
+- 논리 expert 읽기량, 프로세스의 스토리지 읽기량, 장치의 읽기량을 구분합니다.
+- 소스·바이너리 해시, 실행 인자, 실제 입력 길이, cache 상태, 초기 expert 배치와 개별 결과를 보존합니다.
+- 실패한 요청과 느려진 조건도 공개합니다. 캐시 적중률이나 순차 읽기 대역폭만으로 추론 개선을 주장하지 않습니다.
 
-- which model and which size,
-- how much context (how much text the model keeps in mind),
-- whether it should read pictures.
+## 빌드와 실행
 
-Press Enter each time for the recommended answer. Then it downloads the model (about 70 GB) and starts it. If the
-download stops, run it again: it continues where it left off. Your browser opens the Strata app at
-`http://127.0.0.1:8080`.
+연구용 포크의 공개 설치·실험 절차는 준비 중입니다. 현재는 [원본 Strata의 README](https://github.com/Niko1221/Strata#readme)를 참고할 수 있습니다. 원본 설치는 이 프로젝트의 연구 구성을 자동으로 활성화하지 않습니다.
 
-> **While the model starts, your PC can be slow or stop responding for 1-3 minutes** (longest the first time).
-> Strata loads 35-55 GB into your RAM and locks part of it for the graphics card. This is normal. Wait, and don't
-> close the window. The window shows what Strata is doing.
+포크의 공개 브랜치와 재현 자료를 정리하고 새 환경에서 확인한 뒤, 이곳에 검증된 빌드·실행·벤치마크 명령을 추가합니다.
 
-**Next time**, run `START-HERE.bat` (or `./setup.sh`) again. It starts right away and downloads nothing twice. Close
-its window to stop the model. `UPDATE.bat` (`./update.sh`) updates Strata without starting it. Updating, Docker,
-several cards, where the files go and every option: [docs/INSTALL.md](docs/INSTALL.md).
+## Strata와의 관계 및 기여
 
-## Which model should I pick?
+이 프로젝트는 Strata의 파생 연구 프로젝트입니다. 원본 엔진과 기여자의 작업을 바탕으로 하며, upstream 기능·기존 기여·새로운 변경을 구분합니다.
 
-The installer recommends one for your RAM. The same model comes in several sizes, compressed more or less. Smaller
-sizes are faster. Larger sizes are a bit smarter.
+[CONTRIBUTING.md](CONTRIBUTING.md)와 [AGENTS.md](AGENTS.md)의 원칙을 따릅니다. 기여 가이드는 upstream v0.2.9에서 가져왔고 관련 문서 링크는 해당 버전을 가리킵니다. 최신 내용은 [원본 기여 가이드](https://github.com/Niko1221/Strata/blob/main/CONTRIBUTING.md)에서 확인할 수 있습니다.
 
-| Your RAM | Take | Why |
-| --- | --- | --- |
-| **32 GB** | **Coder** | it fits 32 GB, and it is made for code (with a 24 GB card, Q2_0 and IQ2_XS run too) |
-| **48 GB** | **IQ2_XS** (or Q2_0, the fastest) | the larger sizes do not fit |
-| **64 GB** | **IQ2_XS** (recommended), or IQ3_XXS / IQ3_S | every size fits; IQ3_S is the best and the slowest |
-| **96 GB or more** | **IQ3_S**, or Unsloth's UD-IQ4_XS (~4-bit) | room for the largest sizes with everything else open |
+- upstream 제출 전 기존 이슈·PR을 확인하고, 큰 기능·구조·기본값 변경은 관리자와 먼저 범위를 합의합니다.
+- 새 엔진 기능은 opt-in으로 추가하고 기존 경로의 동작 보존을 확인합니다.
+- 검증 결과는 성공·실패·미실행을 구분합니다. 영향을 받는 backend를 검증하고, 필요한 환경이 없으면 upstream PR을 draft로 유지합니다.
+- 공개 자료에서 개인 경로·입력·인증 정보를 제거하고, 재현 가능한 근거를 함께 제공합니다.
 
-- **[Coder](docs/MODELS.md#coder):** a coding version with half of the experts removed. It reaches 91% of the full
-  model's SWE-bench Verified score (measured by its authors) and fits 32 GB of RAM. It is weaker outside code,
-  including Chinese and other CJK text (#438). For those, take Q2_0, IQ2_XS or IQ3_S, which keep every expert.
-- **[Swift 1.5](docs/MODELS.md#swift-15):** a fine-tune that thinks for a much shorter time before it answers. You
-  get the answer sooner, at about the same quality.
-- **[Unsloth UD-IQ4_XS](docs/MODELS.md#unsloth-ud-iq4_xs):** Unsloth's ~4-bit version, between IQ3_S and
-  UD-Q4_K_XL in quality. A 94 GB download. With less than ~80 GB of RAM, Strata reads part of it from the SSD
-  while it answers, so it is slower there (an NVMe SSD helps).
-- **[Unsloth UD-Q4_K_XL](docs/MODELS.md#unsloth-ud-q4_k_xl-experimental)** (experimental): the closest to the full
-  model. But Strata reads most of it from the SSD while it answers, so it writes only 7-8.5 tokens/s on a 64 GB PC.
-- **[OrcaRouter's Uncensored IQ3_XXS](docs/MODELS.md#orcarouter-uncensored-iq3_xxs):** you set it up by hand. It is
-  not in the installer's menu.
-
-Sizes, downloads and what fits where: [docs/MODELS.md](docs/MODELS.md). To add another model later, run
-`SETUP.bat` (Linux: `./setup.sh --setup`).
-
-## Using it
-
-<p align="center"><img src="docs/media/runpagoda.png" width="900" alt="The Strata app's Monitor tab next to a coding agent"><br>
-<sub>The Strata app's <b>Monitor</b> (left) while a coding agent writes the pagoda garden from the video (right)</sub></p>
-
-- **In the browser:** open `http://127.0.0.1:8080`. It has **Chat**, a live **Monitor** of the model and your
-  GPU/CPU/RAM, and **About** with the settings and addresses.
-- **Your apps and coding agents:** add an "OpenAI-compatible" provider with the base URL
-  **`http://127.0.0.1:8080/v1`**. Any API key and any model name work.
-  - Apps that use Anthropic's API: `http://127.0.0.1:8080/v1/messages` (Claude Code:
-    `ANTHROPIC_BASE_URL=http://127.0.0.1:8080`).
-  - Codex CLI and other apps that use the OpenAI Responses API: `/v1/responses`
-    ([setup](docs/DETAILS.md#the-responses-api-and-codex-cli)).
-- **Thinking:** choose **off, low, medium or high** in the chat menu or in your app's "reasoning effort". Off is the
-  fastest. High is best for hard questions.
-- **Pictures:** say yes to "Images?" in setup. Then click **Picture** in the chat, or attach pictures in your app.
-  AMD cards read pictures on Linux through the processor; on Windows they can't yet.
-- **From your phone or another PC:** `START-HERE.bat --setup --host 0.0.0.0 --api-key <secret>`. Always set a key.
-- **One request at a time:** by default Strata answers one request, and the others wait. To answer several at once,
-  set `"parallel": 2` ([BATCHING.md](docs/BATCHING.md)). On a 12 GB card this makes each answer slower.
-- **Long prompts:** Strata reads the first message of a chat in full, about 1 minute per 30,000 tokens. Follow-up
-  messages start in seconds.
-
-More: [where your chats are stored](docs/INSTALL.md#where-things-are-stored), [the API](docs/DETAILS.md#using-it).
-
-## Something went wrong?
-
-- **My PC froze the first time Strata started.** This is normal while it loads the model. Wait, and don't close the
-  window. Still frozen after 10 minutes? Restart the PC, close other programs and try again, or pick a smaller size.
-- **It stopped while downloading or installing.** Run `START-HERE.bat` (or `./setup.sh`) again. It continues where
-  it stopped.
-- **It's very slow and the disk light keeps blinking, or it says "the engine stopped unexpectedly".** Your PC does
-  not have enough free RAM. Close other programs (browsers use a lot), or pick a smaller size (Q2_0 or IQ2_XS).
-- **It says port 8080 is already in use.** Strata is already running. Look for its window.
-
-More problems and their fixes: [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md). Still stuck? Open an
-[issue](https://github.com/Niko1221/Strata/issues) and attach `strata-<model>.log` from the Strata folder. Found a
-security problem? Report it privately: [SECURITY.md](SECURITY.md).
-
-## How does it work?
-
-Models like this one usually run on servers with hundreds of gigabytes of graphics memory. Your graphics card has
-12-24 GB. Strata makes the model fit by **sharing the work across your whole PC**. Think of a kitchen: the things
-you use all the time stay on the counter, and the rest waits in the pantry.
-
-<p align="center"><img src="docs/media/how-it-works.svg" width="860" alt="The model's 24,576 experts: the busiest on the graphics card, all of them in RAM, a lookup table on the SSD"></p>
-
-- **The model is a team of 24,576 small specialists ("experts").** Each word needs only 10 of them.
-- **Your graphics card** keeps the few thousand experts that are used most often. **Your RAM** holds all of them,
-  and **your processor** works on the rest at the same time. **Your SSD** holds a big lookup table.
-
-<p align="center"><img src="docs/media/guess-and-check.svg" width="860" alt="A small helper guesses the next words; the big model checks them all at once and keeps the right ones"></p>
-
-- **Guess, then check:** a small helper guesses the next few words. The big model checks them all at once. You get
-  the same answer, 1.6-1.8x sooner.
-- **Long texts are read in big pieces** (up to 8,192 tokens at a time), at over 1,000 tokens per second.
-
-The longer explanation: [docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md). Every part and its numbers:
-[the details](docs/DETAILS.md#how-it-works) and the [paper](docs/paper/Strata-Paper.pdf).
-
-## Credits and license
-
-The model is [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) by the Qwen team. It was
-compressed by [ISTA-DASLab](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF), UkisAI (Swift 1.5)
-and Unsloth. Strata uses parts of [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp). All credits:
-[docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md#credits). Strata is open source under the [MIT License](LICENSE). A few
-parts and every model have their own licenses ([which ones](docs/HOW_IT_WORKS.md#license)).
-
-## Support Strata
-
-Strata is free and open source. If it is useful to you, you can support its development:
-
-<p align="center"><a href="https://buymeacoffee.com/strataengine"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" height="50"></a></p>
+원본의 [MIT 라이선스](LICENSE), 저작권 및 [기여자 표기](docs/HOW_IT_WORKS.md#credits)를 보존합니다. 포함된 제3자 코드의 라이선스와 고지도 유지합니다.
