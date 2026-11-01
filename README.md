@@ -1,93 +1,95 @@
 # SSD Expert Supply
 
-**RAM에 다 들어가지 않는 MoE 모델을 위한, SSD expert 공급 최적화 연구 엔진.**
+**English** · [한국어](README.ko.md)
 
-이 프로젝트는 [Strata](https://github.com/Niko1221/Strata)를 기반으로 SSD·DRAM·VRAM 사이의 expert 공급 경로를 연구합니다. 필요한 가중치를 SSD에서 읽어 계산에 사용할 수 있을 때까지의 시간을 줄이고, 실제 입력 처리와 답변 생성 속도를 높이는 것이 목표입니다.
+**An engine research project for supplying MoE experts from SSD when they do not all fit in RAM.**
 
-출발점은 RAM expert 배치를 대화에 맞춰 바꾸는 RAM_ADAPT와 추론 시간·읽기량을 기록한 기존 실험입니다. 파일 배치, 병렬 읽기, DRAM 버퍼, 캐시, 미리 읽기, 계산과 I/O의 겹치기까지 범위를 넓힙니다.
+Built on [Strata](https://github.com/Niko1221/Strata), this project investigates expert delivery across SSD, DRAM, and VRAM. The goal is to reduce the time from requesting expert weights to having them ready for computation, and to improve real prefill and decode performance.
 
-> 현재는 연구 기반을 정리하는 단계입니다. 아래 성능 수치는 이전 RAM_ADAPT 실험이며, 새 프로젝트의 최신 성능이나 모든 장비에서의 개선을 뜻하지 않습니다.
+The starting point is earlier work on RAM_ADAPT, which adapts RAM expert placement to the conversation, and experiments recording inference time and storage reads. The research extends to file layout, concurrent reads, DRAM buffers, caching, prefetch, and overlap between computation and I/O.
 
-이 `main`의 엔진 소스는 2026-10-08의 Strata `fb58e0db`에서 출발합니다. 아래에 소개하는 v0.2.7 반영 기능과 로컬 v0.2.9 관측 구성은 아직 이 브랜치에 동기화하지 않았습니다. 이번 변경은 프로젝트 소개 문서입니다. 기존 설치·사용 안내는 [원본 README 보관본](README.upstream.md)에 보존했습니다.
+> The project is currently establishing its research foundation. The performance numbers below come from earlier RAM_ADAPT experiments. They are not current performance results for a new engine or a claim of improvement on every machine.
 
-## 어떤 문제를 다루나요?
+The engine source on this `main` starts from Strata commit `fb58e0db`, dated October 8, 2026. The functionality incorporated in v0.2.7 and the local instrumented v0.2.9 configuration described below have not yet been synchronized to this branch. This change introduces the project through documentation. The earlier installation and usage instructions are preserved in [the upstream README copy](README.upstream.md).
 
-MoE 모델은 매 토큰마다 일부 expert만 계산하지만, 다음 토큰이 사용할 expert는 달라집니다. 전체 가중치가 RAM·VRAM에 들어가지 않는 PC에서는 나머지를 SSD에서 공급해야 합니다.
+## The problem
 
-이때 중요한 것은 SSD의 순차 읽기 사양만이 아닙니다. 필요한 데이터를 얼마나 큰 단위로 읽는지, 몇 개의 요청을 동시에 처리하는지, 읽은 데이터를 얼마나 재사용하는지, 계산이 얼마나 기다리는지가 실제 속도를 결정합니다.
+A MoE model computes only a subset of experts for each token, but the next token may select different experts. On a PC that cannot hold all weights in RAM and VRAM, the remaining experts must be supplied from SSD.
 
-우리는 다음을 함께 측정하고 개선합니다.
+Sequential SSD bandwidth alone does not determine inference speed. Read size, concurrency, reuse of loaded data, and the time computation spends waiting all matter.
 
-| 대상 | 연구할 내용 |
+We measure and improve these parts together:
+
+| Area | Research scope |
 |---|---|
-| 파일 배치와 읽기 | expert 저장 단위, 인접 읽기 병합, 비동기 I/O와 동시 요청 수 |
-| DRAM 버퍼 | 할당·복사·동기화 비용, 읽은 버퍼의 재사용 |
-| expert 보관 | DRAM·VRAM 배치, 반입·퇴출 비용, 프리필과 decode의 캐시 간섭 |
-| 미리 읽기와 실행 | 필요한 읽기의 우선순위, 예측 실패 비용, 읽기·전송·계산의 겹치기 |
+| File layout and reads | Expert storage units, merging adjacent reads, asynchronous I/O, and concurrent requests |
+| DRAM buffers | Allocation, copying, synchronization, and reuse of loaded buffers |
+| Expert retention | DRAM/VRAM placement, admission and eviction costs, and cache interference between prefill and decode |
+| Prefetch and execution | Read priorities, prediction costs, and overlap between reads, transfers, and computation |
 
-연구의 기준은 **요청한 expert가 계산에 준비되기까지 걸린 시간과 실제 추론 속도**입니다.
+The evaluation centers on **time until requested experts are ready for computation, and actual inference speed**.
 
-## 지금까지의 작업
+## Work so far
 
-### RAM_ADAPT 개선
+### RAM_ADAPT improvement
 
-RAM에 없던 expert를 반복해서 사용하면 RAM의 덜 쓰이는 expert와 교체해 다음 SSD 읽기를 줄입니다. 개선된 경로는 직전 읽기의 stage buffer에 가중치가 남아 있으면 파일을 다시 읽지 않고 복사하며, 한 층에서 최대 4쌍을 교체합니다.
+When the conversation repeatedly uses an expert missing from RAM, RAM_ADAPT replaces a less-used RAM expert to reduce future SSD reads. The improved path copies weights from a preceding read's stage buffer when they are still available, avoiding another file read, and allows up to four pairs to move per layer.
 
-이 작업은 [PR #3060](https://github.com/Niko1221/Strata/pull/3060)을 통해 Strata v0.2.7에 반영됐습니다. 현재 upstream에도 있는 기능이며, 새 포크만의 기능으로 주장하지 않습니다.
+This work was incorporated into Strata v0.2.7 through [PR #3060](https://github.com/Niko1221/Strata/pull/3060). It is available upstream and is not presented as a feature exclusive to this fork.
 
-아래는 **v0.2.1 기반 실험**에서 같은 모델과 조건으로 120개 ShareGPT 요청을 순서대로 재생한 결과입니다. 각 설정을 새 엔진에서 3회 측정했습니다.
+The following **v0.2.1-based experiments** replayed 120 ShareGPT requests in order, with matched conditions within each model. Each setting was measured in three fresh engine runs.
 
-| 모델 | RAM_ADAPT 끔 | 개선 전 `=8` | stage-buffer 개선 `=1` | 개선 전 대비 |
+| Model | RAM_ADAPT off | Before the improvement, `=8` | Stage-buffer improvement, `=1` | Gain over the previous implementation |
 |---|---:|---:|---:|---:|
 | IQ2_XS decode | 37.70 tok/s | 48.71 tok/s | **51.40 tok/s** | **+5.5%** |
 | IQ3_XXS decode | 23.24 tok/s | 33.07 tok/s | **38.71 tok/s** | **+17.1%** |
 
-측정 환경: RTX 3060 12GB, RAM 32GB, Linux, NVMe SSD, RAM expert 예산 20.5GiB, K8V4, MTP 3/T3, async adaptation 사용. 각 실행은 같은 초기 stock expert profile에서 시작하고 모델의 page cache를 비웠습니다. 실제 VRAM expert slot은 IQ2 3,769개, IQ3 2,791개였습니다. 같은 모델 안에서 설정을 비교한 수치입니다.
+Environment: RTX 3060 12 GB, 32 GB RAM, Linux, NVMe SSD, 20.5 GiB RAM expert budget, K8V4, MTP 3/T3, and asynchronous adaptation. Every run started from the same stock expert profile, with the model's page cache dropped. Actual VRAM expert slots were 3,769 for IQ2 and 2,791 for IQ3. Comparisons are between settings within the same model.
 
-`standard-v1` 요청 재생에서 개선 전 `=8` 대비 추가 decode 이득은 IQ2 +1.6%, IQ3 +3.9%로 측정 변동과 구분되지 않았습니다. 이 재생은 `--greedy`를 사용했으므로 공식 `strata bench run` 표준 결과가 아닙니다. 짧은 요청부터 긴 대화까지 항상 같은 이득이 난다는 결론은 내리지 않습니다.
+On the `standard-v1` request replay, additional decode gains over the previous `=8` implementation were +1.6% for IQ2 and +3.9% for IQ3, indistinguishable from run variation. That replay used `--greedy` and is not a conforming `strata bench run` standard result. These measurements do not establish a uniform gain across short requests and long conversations.
 
-입력 구성과 실행별 수치는 [재현 키트](https://github.com/SanghunYun/Strata/tree/ram-adapt-replay)와 [PR의 측정 조건](https://github.com/Niko1221/Strata/pull/3060)에 있습니다.
+Input construction and per-run measurements are available in the [replay kit](https://github.com/SanghunYun/Strata/tree/ram-adapt-replay) and the [PR's measurement description](https://github.com/Niko1221/Strata/pull/3060).
 
-### 관측과 재현
+### Observability and reproducibility
 
-- 입력 처리와 decode 시간을 구간별로 기록하고, 전체 시간과 구간 합의 잔차를 확인합니다.
-- decode window별 시간, expert 읽기, RAM 교체를 기록하는 선택적 계측을 만들었습니다. [PR #3631](https://github.com/Niko1221/Strata/pull/3631)
-- 엔진 재시작, 초기 expert profile 복원, 설정별 workload 재생, 설정·프로필 복원을 기존 실험 도구로 수행합니다.
+- Record prefill and decode sections, and check the residual between total time and the named sections.
+- Optional instrumentation records each decode window's time, expert reads, and RAM moves. [PR #3631](https://github.com/Niko1221/Strata/pull/3631)
+- Existing experiment tools restart the engine, restore initial expert profiles, replay workloads for each setting, and restore configuration and profiles afterward.
 
-현재 로컬 기준 엔진은 Strata v0.2.9에 기존 관측 기능을 적용한 구성입니다. 빌드와 기동 확인은 완료했으며, 대표 workload의 최신 성능 비교는 다음 단계입니다.
+The current local reference engine is Strata v0.2.9 with existing observability instrumentation. Build and deployment smoke checks have passed; a current performance comparison on representative workloads is the next step.
 
-## 다음 실험
+## Next experiments
 
-1. 같은 최신 구성에서 기준선을 두 번 측정해 실행 변동과 시간표를 확인합니다.
-2. SSD 읽기, DRAM 복사, 버퍼 대기, 계산과 겹치는 시간을 구분합니다.
-3. 실제 expert 읽기 요청을 기록하고 재생하는 공급 벤치마크를 만듭니다.
-4. 큰 병목부터 한 가지씩 바꾸고, 공급 측정과 실제 엔진 양쪽에서 검증합니다.
+1. Measure the same current baseline twice to establish variation and the timing breakdown.
+2. Separate SSD reads, DRAM copies, buffer waits, and overlap with computation.
+3. Build an expert-delivery benchmark that records and replays actual expert read requests.
+4. Change one major bottleneck at a time and verify it in both delivery measurements and the real engine.
 
-첫 개발 환경은 Linux·NVIDIA GPU와 Qwen3.8-Flash-Next입니다. 다른 장비와 모델의 성능·호환성은 해당 환경에서 측정한 뒤 표시합니다.
+The initial development target is Linux with NVIDIA GPUs and Qwen3.8-Flash-Next. Performance and compatibility on other hardware and models will be reported after measurement on those configurations.
 
-## 측정 원칙
+## Measurement principles
 
-- 같은 모델·계산 설정·메모리 예산으로 변경 전후를 비교합니다.
-- prefill과 decode, 짧은 입력과 긴 입력을 나눠 보고합니다.
-- 논리 expert 읽기량, 프로세스의 스토리지 읽기량, 장치의 읽기량을 구분합니다.
-- 소스·바이너리 해시, 실행 인자, 실제 입력 길이, cache 상태, 초기 expert 배치와 개별 결과를 보존합니다.
-- 실패한 요청과 느려진 조건도 공개합니다. 캐시 적중률이나 순차 읽기 대역폭만으로 추론 개선을 주장하지 않습니다.
+- Match the model, computation settings, and memory budget in before/after comparisons.
+- Report prefill and decode separately, and distinguish short and long inputs.
+- Distinguish logical expert reads, process storage reads, and device traffic.
+- Retain source and binary hashes, effective arguments, actual input lengths, cache state, initial expert placement, and individual run results.
+- Report failed requests and regressions. Cache hit rate or sequential read bandwidth alone does not establish an inference improvement.
 
-## 빌드와 실행
+## Build and run
 
-연구용 포크의 공개 설치·실험 절차는 준비 중입니다. 현재는 [원본 Strata의 README](https://github.com/Niko1221/Strata#readme)를 참고할 수 있습니다. 원본 설치는 이 프로젝트의 연구 구성을 자동으로 활성화하지 않습니다.
+Public installation and experiment instructions for the research fork are being prepared. For now, see the [upstream Strata README](https://github.com/Niko1221/Strata#readme). Installing upstream Strata does not automatically enable this project's research configuration.
 
-포크의 공개 브랜치와 재현 자료를 정리하고 새 환경에서 확인한 뒤, 이곳에 검증된 빌드·실행·벤치마크 명령을 추가합니다.
+Validated build, run, and benchmark commands will be added here after the public branch and reproduction artifacts are organized and checked in a fresh environment.
 
-## Strata와의 관계 및 기여
+## Relationship to Strata and contributions
 
-이 프로젝트는 Strata의 파생 연구 프로젝트입니다. 원본 엔진과 기여자의 작업을 바탕으로 하며, upstream 기능·기존 기여·새로운 변경을 구분합니다.
+This is a Strata-derived research project. It builds on the upstream engine and its contributors' work, and distinguishes upstream functionality, earlier contributions, and new changes.
 
-[CONTRIBUTING.md](CONTRIBUTING.md)와 [AGENTS.md](AGENTS.md)의 원칙을 따릅니다. 기여 가이드는 upstream v0.2.9에서 가져왔고 관련 문서 링크는 해당 버전을 가리킵니다. 최신 내용은 [원본 기여 가이드](https://github.com/Niko1221/Strata/blob/main/CONTRIBUTING.md)에서 확인할 수 있습니다.
+Follow [CONTRIBUTING.md](CONTRIBUTING.md) and [AGENTS.md](AGENTS.md). The contribution guide was brought over from upstream v0.2.9, with its documentation links pointing to that version. Check the [upstream contribution guide](https://github.com/Niko1221/Strata/blob/main/CONTRIBUTING.md) for updates.
 
-- upstream 제출 전 기존 이슈·PR을 확인하고, 큰 기능·구조·기본값 변경은 관리자와 먼저 범위를 합의합니다.
-- 새 엔진 기능은 opt-in으로 추가하고 기존 경로의 동작 보존을 확인합니다.
-- 검증 결과는 성공·실패·미실행을 구분합니다. 영향을 받는 backend를 검증하고, 필요한 환경이 없으면 upstream PR을 draft로 유지합니다.
-- 공개 자료에서 개인 경로·입력·인증 정보를 제거하고, 재현 가능한 근거를 함께 제공합니다.
+- Search existing issues and PRs before upstream submissions, and agree scope with maintainers before substantial features, architecture changes, or default changes.
+- Keep new engine features opt-in and verify preservation of the existing path's behavior.
+- Separate passed, failed, and not-run checks. Validate affected backends; keep an upstream PR draft when required environments are unavailable.
+- Remove private paths, inputs, and credentials from public artifacts, and supply reproducible evidence.
 
-원본의 [MIT 라이선스](LICENSE), 저작권 및 [기여자 표기](docs/HOW_IT_WORKS.md#credits)를 보존합니다. 포함된 제3자 코드의 라이선스와 고지도 유지합니다.
+Preserve the upstream [MIT license](LICENSE), copyright notices, and [contributor credit](docs/HOW_IT_WORKS.md#credits), along with the licenses and notices of included third-party code.
